@@ -1,0 +1,149 @@
+.venv\Scripts\activate
+
+how to train a minimal llm
+
+To train a minimal Large Language Model (LLM) from scratch, you need to build a causal GPT-style Transformer and train it to predict the next token in a text sequence.Below is a complete, minimal pipeline using Python and PyTorch that you can run on a standard laptop CPU or consumer GPU.1. Define the Network ArchitectureWe will implement a miniature Decoder-Only Transformer block with causal masking. This prevents the model from looking at future tokens while training.pythonimport torch
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MinimalAttention(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.embed_dim = embed_dim
+        # Combine Q, K, V projections into one linear layer for speed
+        self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        # Project to Query, Key, and Value matrices
+        q, k, v = self.qkv_proj(x).split(self.embed_dim, dim=-1) #
+        
+        # Compute Attention Scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.embed_dim ** 0.5) #
+        
+        # Apply Causal Mask (look-ahead mask)
+        mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, T, T) #
+        scores = scores.masked_fill(mask == 0, float('-inf')) #
+        
+        # Softmax to get weights and compute weighted sum of values
+        attn_weights = F.softmax(scores, dim=-1) #
+        context = torch.matmul(attn_weights, v) #
+        
+        return self.out_proj(context)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embed_dim) #
+        self.attn = MinimalAttention(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim) #
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim)
+        )
+
+    def forward(self, x):
+        # Pre-LN residual connections
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+class MinimalLLM(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, num_layers=2, max_seq_len=64):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim) #
+        self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
+        self.blocks = nn.Sequential(*[TransformerBlock(embed_dim) for _ in range(num_layers)]) #
+        self.ln_f = nn.LayerNorm(embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size) #
+
+    def forward(self, idx):
+        B, T = idx.size()
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
+        
+        # Combine token and positional representations
+        x = self.token_embedding(idx) + self.pos_embedding(pos)
+        x = self.blocks(x)
+        logits = self.lm_head(self.ln_f(x))
+        return logits
+
+請謹慎使用程式碼。
+
+2. Prepare the DataReal LLMs use Byte-Pair Encoding (BPE) tokenizers, but for a minimal setup, we can build a simple character-level tokenizer.python# Sample text corpus
+text = "the big cat sat on the big mat. the small dog ran to the small house." #
+
+# Character-level tokenizer setup
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+char_to_int = {ch: i for i, ch in enumerate(chars)}
+int_to_char = {i: ch for i, ch in enumerate(chars)}
+
+def encode(s): return [char_to_int[c] for c in s]
+def decode(l): return ''.join([int_to_char[i] for i in l])
+
+# Convert corpus to tensor
+data = torch.tensor(encode(text), dtype=torch.long)
+
+# Create batches where Y is X shifted by one position
+def get_batch(data, batch_size=4, max_seq_len=16):
+    ix = torch.randint(len(data) - max_seq_len, (batch_size,))
+    x = torch.stack([data[i:i+max_seq_len] for i in ix])
+    y = torch.stack([data[i+1:i+max_seq_len+1] for i in ix]) # Target shifted by 1
+    return x, y
+請謹慎使用程式碼。
+
+3. The Training LoopWe initialize the model, pass inputs through it, and calculate cross-entropy loss against the shifted targets.pythondevice = "cuda" if torch.cuda.is_available() else "cpu" #
+model = MinimalLLM(vocab_size=vocab_size).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3) #
+
+print(f"Training on: {device}")
+
+# Run optimization steps
+for step in range(500):
+    xb, yb = get_batch(data, batch_size=8, max_seq_len=16)
+    xb, yb = xb.to(device), yb.to(device)
+    
+    # Forward pass
+    logits = model(xb)
+    
+    # Reshape tensors for PyTorch's cross entropy loss
+    B, T, C = logits.shape
+    loss = F.cross_entropy(logits.view(B*T, C), yb.view(B*T)) #
+    
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward() #
+    optimizer.step() #
+    
+    if step % 100 == 0:
+        print(f"Step {step}: Loss = {loss.item():.4f}")
+
+
+4. Text GenerationAfter optimization, you can prompt the trained network to autoregressively predict tokens one by one.pythondef generate(model, prompt, max_new_tokens=20):
+    model.eval()
+    context = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
+    
+    for _ in range(max_new_tokens):
+        # Crop context if it exceeds max length
+        context_cond = context[:, -16:]
+        logits = model(context_cond)
+        
+        # Focus only on the last time step output
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sample next index from the distribution
+        next_token = torch.multinomial(probs, num_samples=1)
+        context = torch.cat((context, next_token), dim=1)
+        
+    return decode(context[0].tolist())
+
+# Test the model
+print("\nGenerated Text Output:")
+print(generate(model, prompt="the big ", max_new_tokens=25))
+請謹慎使用程式碼。
+
+Moving Beyond the BasicsIf you intend to scale this up beyond simple practice data:Tokenization: Swap the raw text dictionary for Hugging Face Tokenizers or OpenAI's tiktoken to process sub-word units efficiently.Pre-training: Train the model on clean, massive datasets like FineWeb to help it pick up universal grammar rules.Instruction Tuning (SFT): Convert the base language engine into an assistant by running a second phase of training using conversational instructions (e.g., {"instruction": "...", "output": "..."}).Are you building this project for educational fun, or do you have a specific target domain/dataset in mind? I can provide code adjustments for loading custom text or adding modern features like Multi-Head Attention.
